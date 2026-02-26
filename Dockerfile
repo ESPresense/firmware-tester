@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     uhubctl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir platformio esptool pyserial
+RUN pip install --no-cache-dir platformio esptool pyserial "click<8.2.0"
 
 ENV PLATFORMIO_CACHE_DIR=/cache/platformio
 
