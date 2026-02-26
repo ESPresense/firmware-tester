@@ -75,6 +75,15 @@ def main():
 
             for pattern in CRASH_PATTERNS:
                 if pattern in line:
+                    error_start_time = time.monotonic()
+                    while time.monotonic() - error_start_time < 5:
+                        try:
+                            error_line = ser.readline().decode("utf-8", errors="replace").rstrip()
+                            if error_line:
+                                print(error_line, flush=True)
+                        except serial.SerialException as e:
+                            print(f"ERROR: Serial read error during crash capture: {e}", file=sys.stderr)
+                            break
                     print(f"FAIL: Crash pattern detected: '{pattern}'")
                     sys.exit(1)
 
