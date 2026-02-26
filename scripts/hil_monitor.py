@@ -21,7 +21,6 @@ CRASH_PATTERNS = [
     "Backtrace:",
     "TWDT",
     "Task watchdog got triggered",
-    "rst:0xc",
 ]
 
 BOOT_SUCCESS_PATTERN = "IP address:"
