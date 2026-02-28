@@ -7,9 +7,11 @@ Exit codes:
   1 = crash detected
   2 = boot timeout (IP address not seen within 90s)
   3 = serial error
+  4 = no scan results seen
 """
 
 import argparse
+import re
 import sys
 import time
 
@@ -25,6 +27,7 @@ CRASH_PATTERNS = [
 
 BOOT_SUCCESS_PATTERN = "IP address:"
 BOOT_TIMEOUT_SECS = 90
+DEFAULT_SCAN_RESULT_PATTERN = r"^\s*\d+\s+\w+\s+\|"
 
 
 def format_duration(seconds):
@@ -45,7 +48,18 @@ def main():
     parser.add_argument("--port", required=True, help="Serial device path")
     parser.add_argument("--duration", type=int, required=True, help="Monitor duration in seconds")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate")
+    parser.add_argument(
+        "--scan-pattern",
+        default=DEFAULT_SCAN_RESULT_PATTERN,
+        help="Regex that identifies a BLE scan result line",
+    )
+    parser.add_argument(
+        "--allow-no-scan",
+        action="store_true",
+        help="Pass even if no scan result lines are seen",
+    )
     args = parser.parse_args()
+    scan_result_pattern = re.compile(args.scan_pattern)
 
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1)
@@ -57,12 +71,25 @@ def main():
 
     start = time.monotonic()
     booted = False
+    saw_scan_result = False
 
     try:
         while True:
             elapsed = time.monotonic() - start
 
             if elapsed >= args.duration:
+                if not booted:
+                    print(
+                        f"FAIL: Boot was not confirmed before the "
+                        f"{format_duration(args.duration)} monitor window elapsed."
+                    )
+                    sys.exit(2)
+                if not args.allow_no_scan and not saw_scan_result:
+                    print(
+                        f"FAIL: No scan results matching /{args.scan_pattern}/ were seen in "
+                        f"{format_duration(args.duration)}."
+                    )
+                    sys.exit(4)
                 print(f"PASS: {format_duration(args.duration)} elapsed cleanly.")
                 sys.exit(0)
 
@@ -84,6 +111,10 @@ def main():
             if not booted and BOOT_SUCCESS_PATTERN in line:
                 booted = True
                 print(f"[hil] Boot confirmed at {elapsed:.1f}s")
+
+            if not saw_scan_result and scan_result_pattern.search(line):
+                saw_scan_result = True
+                print(f"[hil] First scan result confirmed at {elapsed:.1f}s")
 
             for pattern in CRASH_PATTERNS:
                 if pattern in line:
