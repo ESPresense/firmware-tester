@@ -1,0 +1,7 @@
+platformio==6.1.19
+esptool==5.2.0
+pyserial==3.5
+click==8.1.8
+wheel==0.46.3
+zopfli==0.4.1
+tasmota-metrics==0.4.3
