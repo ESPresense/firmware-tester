@@ -8,7 +8,14 @@ RUN apt-get update && apt-get install -y \
     uhubctl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir platformio esptool pyserial "click<8.2.0"
+RUN pip install --no-cache-dir \
+    platformio \
+    esptool \
+    pyserial \
+    "click<8.2.0" \
+    "wheel>=0.35.1" \
+    "zopfli>=0.2.2" \
+    "tasmota-metrics>=0.3.3"
 
 ENV PLATFORMIO_CACHE_DIR=/cache/platformio
 
