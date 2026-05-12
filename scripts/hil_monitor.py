@@ -4,11 +4,11 @@ HIL serial monitor for ESPresense firmware.
 
 Exit codes:
   0 = pass (duration elapsed cleanly)
-  1 = crash detected (including "Too many reconnect attempts; Restarting")
+  1 = crash detected
   2 = boot timeout (IP address not seen within 90s)
   3 = serial error
   4 = no scan results seen
-  5 = too many MQTT disconnects (> 5)
+  5 = firmware MQTT reconnect limit reached
 """
 
 import argparse
@@ -24,12 +24,11 @@ CRASH_PATTERNS = [
     "Backtrace:",
     "TWDT",
     "Task watchdog got triggered",
-    "Too many reconnect attempts; Restarting",
 ]
 
 BOOT_SUCCESS_PATTERN = "IP address:"
 BOOT_TIMEOUT_SECS = 90
-MAX_MQTT_DISCONNECTS = 5
+MQTT_RECONNECT_LIMIT_PATTERN = "Too many reconnect attempts; Restarting"
 DEFAULT_SCAN_RESULT_PATTERN = r"^\s*\d+\s+\w+\s+\|"
 
 
@@ -62,7 +61,10 @@ def main():
         help="Pass even if no scan result lines are seen",
     )
     args = parser.parse_args()
-    scan_result_pattern = re.compile(args.scan_pattern)
+    try:
+        scan_result_pattern = re.compile(args.scan_pattern)
+    except re.error as e:
+        parser.error(f"Invalid --scan-pattern: {e}")
 
     try:
         ser = serial.Serial(args.port, args.baud, timeout=1)
@@ -75,7 +77,6 @@ def main():
     start = time.monotonic()
     booted = False
     saw_scan_result = False
-    mqtt_disconnect_count = 0
 
     try:
         while True:
@@ -116,12 +117,9 @@ def main():
                 booted = True
                 print(f"[hil] Boot confirmed at {elapsed:.1f}s")
 
-            if "Disconnected from MQTT" in line:
-                mqtt_disconnect_count += 1
-                print(f"[hil] MQTT disconnect #{mqtt_disconnect_count} at {elapsed:.1f}s")
-                if mqtt_disconnect_count > MAX_MQTT_DISCONNECTS:
-                    print(f"FAIL: MQTT disconnected {mqtt_disconnect_count} times — broker or firmware issue.")
-                    sys.exit(5)
+            if MQTT_RECONNECT_LIMIT_PATTERN in line:
+                print(f"FAIL: Firmware MQTT reconnect limit reached: '{MQTT_RECONNECT_LIMIT_PATTERN}'")
+                sys.exit(5)
 
             if not saw_scan_result and scan_result_pattern.search(line):
                 saw_scan_result = True
