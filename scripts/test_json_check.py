@@ -57,7 +57,8 @@ def serve(sock, mode, stop):
                             conn.close()  # drop keep-alive mid-stream -> IncompleteRead/reset
                             return
                         if counter[0] % 7 == 0:
-                            conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
+                            # firmware's low-heap refusal (ESPresense#2428): 429, not a false 200
+                            conn.sendall(resp(429, "Too Many Requests", b'{"error":"low memory"}'))
                             continue
 
                     if mode == "oom" and counter[0] % 3 == 0:
@@ -115,7 +116,7 @@ print("fixed server  -> clean")
 
 flaky = run("flaky")
 assert not flaky, f"detector false-positived on load-shedding node: {flaky}"
-print("flaky server  -> clean (drops + 503 tolerated)")
+print("flaky server  -> clean (drops + 429 tolerated)")
 
 oom = run("oom")
 assert oom, "detector MISSED the low-heap 200-null body"

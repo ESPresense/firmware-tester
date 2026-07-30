@@ -55,12 +55,12 @@ def json_endpoint_check(ip, bug):
     shifted stream answers the wrong question, or hands back the 429 text as a 200 body.
 
     The rule is simple: a 200 must be a complete, correct JSON object for the URL that
-    asked for it. Refusing to serve under pressure is fine — 429 (busy), 503 (low heap),
+    asked for it. Refusing to serve under pressure is fine — 429 (busy or low heap),
     or dropping the connection at the TCP layer (IncompleteRead / reset / refused) are all
     acceptable load-shedding and are counted, logged, and reconnected past, never failed
     on. But a *200* that is null, truncated, unparseable, or the wrong document is the
     server lying about success — that is the double-send, or the low-heap null-body path
-    (fixed by returning 503) — and it fails the build.
+    (fixed in firmware by refusing with 429) — and it fails the build.
     """
     TOO_MANY = b"Too Many Requests"
 
@@ -82,7 +82,7 @@ def json_endpoint_check(ip, bug):
                 conn = None
                 continue
 
-            # Refusing to serve is acceptable: 429 busy, 503 low-heap, anything non-200.
+            # Refusing to serve is acceptable: 429 (busy or low-heap), or any non-200.
             if resp.status != 200:
                 if resp.status not in (429, 503):
                     drops.append(f"HTTP {resp.status} on {path}")
@@ -105,11 +105,11 @@ def json_endpoint_check(ip, bug):
 
             # A 200 that isn't a JSON object is the low-heap null-body path: the buffer
             # failed to allocate, the doc serialized as `null`, and it shipped as 200
-            # instead of 503. That is the bug the 503 guard fixes.
+            # instead of 429. That is the bug the low-heap guard fixes.
             if not isinstance(doc, dict):
                 conn.close()
                 raise _Bug(f"GET {path} returned a 200 with non-object JSON ({body[:40]!r}) "
-                           f"— low-heap serving should 503, not 200")
+                           f"— low-heap serving should refuse (429), not 200")
 
             # The double-send signature: a 200 whose document doesn't match the URL.
             if ("devices" in doc) != path.endswith("/devices"):
@@ -159,6 +159,9 @@ def _run(fn, n, bugs, drops):
         fn(n, drops)
     except _Bug as e:
         bugs.append(str(e))
+    except Exception as e:  # noqa: BLE001 - never let a worker die silently and still "pass"
+        drops.append(f"worker {n} crashed: {type(e).__name__}: {e}")
+        print(f"[hil] /json worker {n} crashed: {type(e).__name__}: {e}", flush=True)
 
 
 def format_duration(seconds):
