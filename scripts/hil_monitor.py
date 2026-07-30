@@ -164,7 +164,7 @@ def json_endpoint_check(ip, bug):
 
 
 class _Bug(Exception):
-    """The double-send signature was observed — the one hard failure."""
+    """A /json contract violation that must fail the build."""
 
 
 def _run(fn, n, bugs, drops, crashes):
