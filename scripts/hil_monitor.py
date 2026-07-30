@@ -37,7 +37,7 @@ DEFAULT_SCAN_RESULT_PATTERN = r"^\s*\d+\s+\w+\s+\|"
 
 IP_PATTERN = re.compile(r"IP address:\s*(\d+\.\d+\.\d+\.\d+)")
 JSON_CHECK_DELAY_SECS = 15  # let the web server settle after boot
-JSON_CHECK_WORKERS = 2      # enough to collide; a constrained node need not survive a stampede
+JSON_CHECK_WORKERS = 3      # concurrent connections — enough to reliably collide on serveJson
 JSON_CHECK_REQUESTS = 12    # sequential requests per worker, on one kept-alive connection
 
 
