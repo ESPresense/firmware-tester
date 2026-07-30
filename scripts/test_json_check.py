@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Prove json_endpoint_check catches the serveJson double-send and passes a correct server.
+"""Prove json_endpoint_check catches the serveJson double-send AND tolerates load-shedding.
 
-Two mock servers on raw sockets (BaseHTTPRequestHandler can't send two responses to one
-request, which is the whole point):
-  buggy  - mimics pre-fix serveJson: when busy, writes the 429 AND the 200 JSON
-  fixed  - mimics post-fix serveJson: when busy, writes only the 429
+Raw-socket mocks (BaseHTTPRequestHandler can't send two responses to one request, which
+is the whole point):
+  buggy   - pre-fix serveJson: when busy, writes the 429 AND the 200 JSON (the bug)
+  fixed   - post-fix serveJson: when busy, writes only the 429
+  flaky   - correct load-shedding a real constrained node does: drops keep-alive
+            connections mid-body, and refuses with 429 when it can't afford the buffer.
+            MUST pass — refusing to serve is fine.
+  oom     - the low-heap null-body bug: under pressure returns a 200 with body `null`
+            instead of refusing. MUST be caught — a 200 that lies about success is the
+            whole point of the check (this is what ESPresense#2428 fixes in firmware).
 """
 import os
 import socket
@@ -13,9 +19,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hil_monitor import json_endpoint_check  # noqa: E402
-
 import hil_monitor  # noqa: E402
+from hil_monitor import json_endpoint_check  # noqa: E402
 
 hil_monitor.JSON_CHECK_DELAY_SECS = 0  # don't wait 15s in a test
 
@@ -30,32 +35,62 @@ def resp(status, reason, body):
     )
 
 
-def serve(sock, buggy, stop):
+def serve(sock, mode, stop):
     serving = threading.Lock()
+    counter = [0]
+
+    def respond(conn, req):
+        """Handle one complete request. Return False to close the connection."""
+        body = DEVICES if b"/json/devices" in req else INFO
+        counter[0] += 1
+
+        if mode == "flaky":
+            # Correct load-shedding — refusing to serve, never a false 200:
+            if counter[0] % 4 == 0:
+                return False  # drop keep-alive mid-stream -> IncompleteRead/reset
+            if counter[0] % 7 == 0:
+                # firmware's low-heap refusal (ESPresense#2428): 429, not a false 200
+                conn.sendall(resp(429, "Too Many Requests", b'{"error":"low memory"}'))
+                return True
+
+        if mode == "oom" and counter[0] % 3 == 0:
+            # The bug: a 200 that lies — buffer failed, doc serialized as null.
+            conn.sendall(resp(200, "OK", b"null"))
+            return True
+
+        if mode == "stale503" and counter[0] % 3 == 0:
+            # Wrong/old firmware: low-heap refusal as 503 instead of 429.
+            conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
+            return True
+
+        busy = not serving.acquire(blocking=False)
+        if busy:
+            conn.sendall(resp(429, "Too Many Requests", b"Too Many Requests"))
+            if mode == "buggy":
+                conn.sendall(resp(200, "OK", body))  # the bug: no early return
+            return True
+        try:
+            time.sleep(0.02)  # widen the window so workers actually collide
+            conn.sendall(resp(200, "OK", body))
+        finally:
+            serving.release()
+        return True
 
     def handle(conn):
         conn.settimeout(5)
+        # TCP is a stream: a request can span recv() calls and several can arrive in one.
+        # Buffer and only process a request once its terminating blank line has arrived.
+        buf = b""
         try:
             while True:
-                data = conn.recv(4096)
-                if not data:
+                chunk = conn.recv(4096)
+                if not chunk:
                     return
-                for req in data.split(b"\r\n\r\n")[:-1]:  # one response per pipelined request
-                    # serveJson picks the document from the URL, same as the firmware
-                    body = DEVICES if b"/json/devices" in req else INFO
-                    busy = not serving.acquire(blocking=False)
-                    if busy:
-                        conn.sendall(resp(429, "Too Many Requests", b"Too Many Requests"))
-                        if not buggy:
-                            continue
-                        # the bug: no early return, so a second response follows
-                        conn.sendall(resp(200, "OK", body))
-                        continue
-                    try:
-                        time.sleep(0.02)  # widen the window so workers actually collide
-                        conn.sendall(resp(200, "OK", body))
-                    finally:
-                        serving.release()
+                buf += chunk
+                while b"\r\n\r\n" in buf:  # GET requests have no body; blank line ends one
+                    req, buf = buf.split(b"\r\n\r\n", 1)
+                    if not respond(conn, req):
+                        return
         except OSError:
             pass
         finally:
@@ -69,27 +104,47 @@ def serve(sock, buggy, stop):
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
-def run(buggy):
+def run(mode):
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
     sock.listen(8)
     sock.settimeout(1)
     stop = threading.Event()
-    threading.Thread(target=serve, args=(sock, buggy, stop), daemon=True).start()
+    threading.Thread(target=serve, args=(sock, mode, stop), daemon=True).start()
 
-    failure = []
-    json_endpoint_check(f"127.0.0.1:{sock.getsockname()[1]}", failure)
+    bug = []
+    json_endpoint_check(f"127.0.0.1:{sock.getsockname()[1]}", bug)
     stop.set()
     sock.close()
-    return failure
+    return bug
 
 
-buggy = run(buggy=True)
+buggy = run("buggy")
 assert buggy, "detector MISSED the double-send bug"
 print(f"buggy server  -> detected: {buggy[0]}")
 
-fixed = run(buggy=False)
+fixed = run("fixed")
 assert not fixed, f"detector false-positived on correct server: {fixed}"
 print("fixed server  -> clean")
-print("\nOK: detector catches the bug and does not false-positive.")
+
+flaky = run("flaky")
+assert not flaky, f"detector false-positived on load-shedding node: {flaky}"
+print("flaky server  -> clean (drops + 429 tolerated)")
+
+oom = run("oom")
+assert oom, "detector MISSED the low-heap 200-null body"
+print(f"oom server    -> detected: {oom[0]}")
+
+stale503 = run("stale503")
+assert stale503, "detector MISSED a 503 (wrong/old firmware — must be 429)"
+print(f"stale503 srv  -> detected: {stale503[0]}")
+
+# _run routing: an unexpected worker exception is a harness crash, tracked apart from
+# load-shedding drops so it can't hide behind a "clean pass with shedding".
+_bugs, _drops, _crashes = [], [], []
+hil_monitor._run(lambda n, drops: (_ for _ in ()).throw(RuntimeError("boom")), 0, _bugs, _drops, _crashes)
+assert _crashes and not _bugs and not _drops, (_bugs, _drops, _crashes)
+print("crash routing -> tracked as crash, not a drop")
+
+print("\nOK: catches double-send + 200-null, tolerates 429+drops, rejects 503, no false positives.")

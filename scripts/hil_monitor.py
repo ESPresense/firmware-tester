@@ -37,48 +37,93 @@ DEFAULT_SCAN_RESULT_PATTERN = r"^\s*\d+\s+\w+\s+\|"
 
 IP_PATTERN = re.compile(r"IP address:\s*(\d+\.\d+\.\d+\.\d+)")
 JSON_CHECK_DELAY_SECS = 15  # let the web server settle after boot
-JSON_CHECK_WORKERS = 3
-JSON_CHECK_REQUESTS = 10  # sequential requests per worker, on one kept-alive connection
+JSON_CHECK_WORKERS = 3      # concurrent connections — enough to reliably collide on serveJson
+JSON_CHECK_REQUESTS = 12    # sequential requests per worker, on one kept-alive connection
 
 
-def json_endpoint_check(ip, failure):
-    """Hammer /json/devices concurrently and verify every response is well-formed.
+def json_endpoint_check(ip, bug):
+    """Detect the serveJson() double-send under concurrent load.
 
     serveJson() serialises itself with a `servingJson` flag and returns 429 when busy.
-    A missing early-return there sends two responses down one socket. The extra one is
-    left in the buffer, so every later response on that connection is off by one.
+    A missing early-return there sends TWO responses down one socket for one request.
+    The extra one is left in the buffer, so every later response on that connection is
+    off by one — and each shifted response is still a valid 200. That is the only thing
+    this check is looking for, and it is the only thing that fails the build.
 
-    That shift is invisible if you only check "is this valid JSON" — the stale response
-    is a perfectly good 200. So each worker reuses one keep-alive connection (to expose
-    the shift at all) and alternates two endpoints with different shapes: /json has no
-    "devices" key, /json/devices does. A shifted stream answers the wrong question.
+    To surface the shift, each worker reuses one keep-alive connection and alternates two
+    endpoints with different shapes: /json has no "devices" key, /json/devices does. A
+    shifted stream answers the wrong question, or hands back the 429 text as a 200 body.
+
+    The rule is simple: a 200 must be a complete, correct JSON object for the URL that
+    asked for it. Refusing to serve under pressure is fine — a 429 (busy or low heap) is
+    the designed refusal and is silently accepted; anything odder that still isn't the bug
+    (a dropped TCP connection, an unexpected non-200/429 status) is counted into the
+    "shed under load" tally, logged, and reconnected past, never failed on. But a *200*
+    that is null, truncated, unparseable, or the wrong document is the server lying about
+    success — the double-send, or the low-heap null-body path (fixed in firmware by
+    refusing with 429) — and it fails the build.
     """
+    TOO_MANY = b"Too Many Requests"
 
-    def worker(n):
-        conn = http.client.HTTPConnection(ip, timeout=10)
-        for i in range(JSON_CHECK_REQUESTS):
-            path = "/json/devices" if i % 2 else "/json"
-            conn.request("GET", path)
-            resp = conn.getresponse()
-            body = resp.read()
-            if resp.status == 429:
-                continue
-            if resp.status != 200:
-                raise AssertionError(f"worker {n} req {i}: GET {path} -> HTTP {resp.status}")
-            try:
-                doc = json.loads(body)
-            except ValueError as e:
-                raise AssertionError(
-                    f"worker {n} req {i}: GET {path} -> body is not valid JSON ({e}); "
-                    f"{len(body)} bytes, starts {body[:80]!r}"
-                )
-            if ("devices" in doc) != path.endswith("/devices"):
-                raise AssertionError(
-                    f"worker {n} req {i}: GET {path} answered with the wrong document "
-                    f"(keys {sorted(doc)}) — a stale response is queued on this "
-                    f"connection, i.e. something sent two responses to one request"
-                )
-        conn.close()
+    def worker(n, drops):
+        conn = None
+        try:
+            for i in range(JSON_CHECK_REQUESTS):
+                path = "/json/devices" if i % 2 else "/json"
+                try:
+                    if conn is None:
+                        conn = http.client.HTTPConnection(ip, timeout=10)
+                    conn.request("GET", path)
+                    resp = conn.getresponse()
+                    body = resp.read()
+                except (OSError, http.client.HTTPException) as e:
+                    # Connection-level hiccup: the node shed load. Not the bug. Reconnect.
+                    drops.append(str(e))
+                    if conn is not None:
+                        conn.close()
+                    conn = None
+                    continue
+
+                # The firmware refuses with 429 (busy or low-heap) — the one accepted
+                # non-200, and silently accepted (not counted as shedding). A 503 means
+                # wrong/old firmware: the low-heap path was deliberately changed from 503
+                # to 429 (ESPresense#2428), so a 503 on a direct connection is a contract
+                # violation, not shedding.
+                if resp.status != 200:
+                    if resp.status == 503:
+                        raise _Bug(f"GET {path} returned 503 — firmware must refuse with 429, not 503")
+                    if resp.status != 429:
+                        drops.append(f"HTTP {resp.status} on {path}")
+                    continue
+
+                # From here a 200 must be a complete, correct object — anything less is a lie.
+
+                # A 200 carrying the 429 text is the double-send caught red-handed.
+                if TOO_MANY in body:
+                    raise _Bug(f"GET {path} returned 200 with the 429 body {TOO_MANY!r} — "
+                               f"two responses were sent for one request")
+
+                try:
+                    doc = json.loads(body)
+                except ValueError as e:
+                    raise _Bug(f"GET {path} returned a 200 with an unparseable body "
+                               f"({len(body)}B, starts {body[:60]!r}) — truncated or garbled") from e
+
+                # A 200 that isn't a JSON object is the low-heap null-body path: the buffer
+                # failed to allocate, the doc serialized as `null`, and it shipped as 200
+                # instead of 429. That is the bug the low-heap guard fixes.
+                if not isinstance(doc, dict):
+                    raise _Bug(f"GET {path} returned a 200 with non-object JSON ({body[:40]!r}) "
+                               f"— low-heap serving should refuse (429), not 200")
+
+                # The double-send signature: a 200 whose document doesn't match the URL.
+                if ("devices" in doc) != path.endswith("/devices"):
+                    raise _Bug(f"GET {path} answered with the wrong document (keys "
+                               f"{sorted(doc)}) — a stale response is queued on this "
+                               f"connection, i.e. two responses were sent for one request")
+        finally:
+            if conn is not None:
+                conn.close()
 
     time.sleep(JSON_CHECK_DELAY_SECS)
 
@@ -92,27 +137,45 @@ def json_endpoint_check(ip, failure):
         print(f"[hil] /json check SKIPPED — {ip} unreachable from the runner ({e})", flush=True)
         return
 
-    errors = []
+    bugs, drops, crashes = [], [], []
     threads = [
-        threading.Thread(target=lambda n=n: _run(worker, n, errors)) for n in range(JSON_CHECK_WORKERS)
+        threading.Thread(target=lambda n=n: _run(worker, n, bugs, drops, crashes))
+        for n in range(JSON_CHECK_WORKERS)
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
-    if errors:
-        failure.append(f"/json misbehaved under concurrent load: {errors[0]}")
+    total = JSON_CHECK_WORKERS * JSON_CHECK_REQUESTS
+    notes = []
+    if drops:
+        notes.append(f"{len(drops)}/{total} shed under load")
+    if crashes:
+        notes.append(f"{len(crashes)} worker crash(es): {crashes[0]}")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
+    if bugs:
+        bug.append(f"/json contract violation: {bugs[0]}")
+    elif crashes:
+        # A checker crash isn't a firmware failure, but it must not read as a clean pass.
+        bug.append(f"/json check harness error: {crashes[0]}")
     else:
-        total = JSON_CHECK_WORKERS * JSON_CHECK_REQUESTS
-        print(f"[hil] /json check passed ({total} concurrent requests to {ip})", flush=True)
+        print(f"[hil] /json check passed ({total} concurrent requests to {ip}){suffix}", flush=True)
 
 
-def _run(fn, n, errors):
+class _Bug(Exception):
+    """A /json contract violation that must fail the build."""
+
+
+def _run(fn, n, bugs, drops, crashes):
     try:
-        fn(n)
-    except Exception as e:  # noqa: BLE001 - any failure here is a test failure
-        errors.append(str(e))
+        fn(n, drops)
+    except _Bug as e:
+        bugs.append(str(e))
+    except Exception as e:  # noqa: BLE001 - never let a worker die silently and still "pass"
+        # A checker crash is not load-shedding; track it apart so it can't hide in the tally.
+        crashes.append(f"worker {n}: {type(e).__name__}: {e}")
+        print(f"[hil] /json worker {n} crashed: {type(e).__name__}: {e}", flush=True)
 
 
 def format_duration(seconds):
