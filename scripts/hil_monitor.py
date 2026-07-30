@@ -82,9 +82,15 @@ def json_endpoint_check(ip, bug):
                 conn = None
                 continue
 
-            # Refusing to serve is acceptable: 429 (busy or low-heap), or any non-200.
+            # The firmware refuses with 429 (busy or low-heap) — that is the one accepted
+            # non-200. A 503 specifically means wrong/old firmware: the low-heap path was
+            # meant to return 503 and was deliberately changed to 429 (ESPresense#2428), so
+            # a 503 on a direct-to-device connection is a contract violation, not shedding.
             if resp.status != 200:
-                if resp.status not in (429, 503):
+                if resp.status == 503:
+                    conn.close()
+                    raise _Bug(f"GET {path} returned 503 — firmware must refuse with 429, not 503")
+                if resp.status != 429:
                     drops.append(f"HTTP {resp.status} on {path}")
                 continue
 
@@ -145,7 +151,7 @@ def json_endpoint_check(ip, bug):
     total = JSON_CHECK_WORKERS * JSON_CHECK_REQUESTS
     shed = f" ({len(drops)}/{total} shed under load)" if drops else ""
     if bugs:
-        bug.append(f"/json returned a bad 200: {bugs[0]}")
+        bug.append(f"/json contract violation: {bugs[0]}")
     else:
         print(f"[hil] /json check passed ({total} concurrent requests to {ip}){shed}", flush=True)
 

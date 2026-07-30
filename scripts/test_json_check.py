@@ -6,10 +6,10 @@ is the whole point):
   buggy   - pre-fix serveJson: when busy, writes the 429 AND the 200 JSON (the bug)
   fixed   - post-fix serveJson: when busy, writes only the 429
   flaky   - correct load-shedding a real constrained node does: drops keep-alive
-            connections mid-body, and returns 503 when it can't afford the buffer.
+            connections mid-body, and refuses with 429 when it can't afford the buffer.
             MUST pass — refusing to serve is fine.
   oom     - the low-heap null-body bug: under pressure returns a 200 with body `null`
-            instead of a 503. MUST be caught — a 200 that lies about success is the
+            instead of refusing. MUST be caught — a 200 that lies about success is the
             whole point of the check (this is what ESPresense#2428 fixes in firmware).
 """
 import json
@@ -64,6 +64,11 @@ def serve(sock, mode, stop):
                     if mode == "oom" and counter[0] % 3 == 0:
                         # The bug: a 200 that lies — buffer failed, doc serialized as null.
                         conn.sendall(resp(200, "OK", b"null"))
+                        continue
+
+                    if mode == "stale503" and counter[0] % 3 == 0:
+                        # Wrong/old firmware: low-heap refusal as 503 instead of 429.
+                        conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
                         continue
 
                     busy = not serving.acquire(blocking=False)
@@ -122,4 +127,8 @@ oom = run("oom")
 assert oom, "detector MISSED the low-heap 200-null body"
 print(f"oom server    -> detected: {oom[0]}")
 
-print("\nOK: catches double-send + 200-null, tolerates 429/503/drops, no false positives.")
+stale503 = run("stale503")
+assert stale503, "detector MISSED a 503 (wrong/old firmware — must be 429)"
+print(f"stale503 srv  -> detected: {stale503[0]}")
+
+print("\nOK: catches double-send + 200-null, tolerates 429+drops, rejects 503, no false positives.")
