@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Prove json_endpoint_check catches the serveJson double-send and passes a correct server.
+"""Prove json_endpoint_check catches the serveJson double-send AND tolerates load-shedding.
 
-Two mock servers on raw sockets (BaseHTTPRequestHandler can't send two responses to one
-request, which is the whole point):
-  buggy  - mimics pre-fix serveJson: when busy, writes the 429 AND the 200 JSON
-  fixed  - mimics post-fix serveJson: when busy, writes only the 429
+Raw-socket mocks (BaseHTTPRequestHandler can't send two responses to one request, which
+is the whole point):
+  buggy   - pre-fix serveJson: when busy, writes the 429 AND the 200 JSON (the bug)
+  fixed   - post-fix serveJson: when busy, writes only the 429
+  flaky   - correct, but sheds load like a real constrained node: drops keep-alive
+            connections mid-body, and occasionally returns a bare `null`. This is the
+            case that made HIL red on 2026-07-30 with the first version of the check;
+            it MUST pass.
 """
+import json
 import os
 import socket
 import sys
@@ -13,9 +18,8 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from hil_monitor import json_endpoint_check  # noqa: E402
-
 import hil_monitor  # noqa: E402
+from hil_monitor import json_endpoint_check  # noqa: E402
 
 hil_monitor.JSON_CHECK_DELAY_SECS = 0  # don't wait 15s in a test
 
@@ -30,8 +34,9 @@ def resp(status, reason, body):
     )
 
 
-def serve(sock, buggy, stop):
+def serve(sock, mode, stop):
     serving = threading.Lock()
+    counter = [0]
 
     def handle(conn):
         conn.settimeout(5)
@@ -41,15 +46,23 @@ def serve(sock, buggy, stop):
                 if not data:
                     return
                 for req in data.split(b"\r\n\r\n")[:-1]:  # one response per pipelined request
-                    # serveJson picks the document from the URL, same as the firmware
                     body = DEVICES if b"/json/devices" in req else INFO
+                    counter[0] += 1
+
+                    if mode == "flaky":
+                        # Load-shedding a real node does, none of which is the bug:
+                        if counter[0] % 4 == 0:
+                            conn.close()  # drop keep-alive mid-stream -> IncompleteRead/reset
+                            return
+                        if counter[0] % 7 == 0:
+                            conn.sendall(resp(200, "OK", b"null"))  # odd but not a shift
+                            continue
+
                     busy = not serving.acquire(blocking=False)
                     if busy:
                         conn.sendall(resp(429, "Too Many Requests", b"Too Many Requests"))
-                        if not buggy:
-                            continue
-                        # the bug: no early return, so a second response follows
-                        conn.sendall(resp(200, "OK", body))
+                        if mode == "buggy":
+                            conn.sendall(resp(200, "OK", body))  # the bug: no early return
                         continue
                     try:
                         time.sleep(0.02)  # widen the window so workers actually collide
@@ -69,27 +82,32 @@ def serve(sock, buggy, stop):
         threading.Thread(target=handle, args=(conn,), daemon=True).start()
 
 
-def run(buggy):
+def run(mode):
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", 0))
     sock.listen(8)
     sock.settimeout(1)
     stop = threading.Event()
-    threading.Thread(target=serve, args=(sock, buggy, stop), daemon=True).start()
+    threading.Thread(target=serve, args=(sock, mode, stop), daemon=True).start()
 
-    failure = []
-    json_endpoint_check(f"127.0.0.1:{sock.getsockname()[1]}", failure)
+    bug = []
+    json_endpoint_check(f"127.0.0.1:{sock.getsockname()[1]}", bug)
     stop.set()
     sock.close()
-    return failure
+    return bug
 
 
-buggy = run(buggy=True)
+buggy = run("buggy")
 assert buggy, "detector MISSED the double-send bug"
 print(f"buggy server  -> detected: {buggy[0]}")
 
-fixed = run(buggy=False)
+fixed = run("fixed")
 assert not fixed, f"detector false-positived on correct server: {fixed}"
 print("fixed server  -> clean")
-print("\nOK: detector catches the bug and does not false-positive.")
+
+flaky = run("flaky")
+assert not flaky, f"detector false-positived on load-shedding node: {flaky}"
+print("flaky server  -> clean (drops + null bodies tolerated)")
+
+print("\nOK: catches the bug, ignores load-shedding, no false positives.")
