@@ -39,48 +39,58 @@ def serve(sock, mode, stop):
     serving = threading.Lock()
     counter = [0]
 
+    def respond(conn, req):
+        """Handle one complete request. Return False to close the connection."""
+        body = DEVICES if b"/json/devices" in req else INFO
+        counter[0] += 1
+
+        if mode == "flaky":
+            # Correct load-shedding — refusing to serve, never a false 200:
+            if counter[0] % 4 == 0:
+                return False  # drop keep-alive mid-stream -> IncompleteRead/reset
+            if counter[0] % 7 == 0:
+                # firmware's low-heap refusal (ESPresense#2428): 429, not a false 200
+                conn.sendall(resp(429, "Too Many Requests", b'{"error":"low memory"}'))
+                return True
+
+        if mode == "oom" and counter[0] % 3 == 0:
+            # The bug: a 200 that lies — buffer failed, doc serialized as null.
+            conn.sendall(resp(200, "OK", b"null"))
+            return True
+
+        if mode == "stale503" and counter[0] % 3 == 0:
+            # Wrong/old firmware: low-heap refusal as 503 instead of 429.
+            conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
+            return True
+
+        busy = not serving.acquire(blocking=False)
+        if busy:
+            conn.sendall(resp(429, "Too Many Requests", b"Too Many Requests"))
+            if mode == "buggy":
+                conn.sendall(resp(200, "OK", body))  # the bug: no early return
+            return True
+        try:
+            time.sleep(0.02)  # widen the window so workers actually collide
+            conn.sendall(resp(200, "OK", body))
+        finally:
+            serving.release()
+        return True
+
     def handle(conn):
         conn.settimeout(5)
+        # TCP is a stream: a request can span recv() calls and several can arrive in one.
+        # Buffer and only process a request once its terminating blank line has arrived.
+        buf = b""
         try:
             while True:
-                data = conn.recv(4096)
-                if not data:
+                chunk = conn.recv(4096)
+                if not chunk:
                     return
-                for req in data.split(b"\r\n\r\n")[:-1]:  # one response per pipelined request
-                    body = DEVICES if b"/json/devices" in req else INFO
-                    counter[0] += 1
-
-                    if mode == "flaky":
-                        # Correct load-shedding — refusing to serve, never a false 200:
-                        if counter[0] % 4 == 0:
-                            conn.close()  # drop keep-alive mid-stream -> IncompleteRead/reset
-                            return
-                        if counter[0] % 7 == 0:
-                            # firmware's low-heap refusal (ESPresense#2428): 429, not a false 200
-                            conn.sendall(resp(429, "Too Many Requests", b'{"error":"low memory"}'))
-                            continue
-
-                    if mode == "oom" and counter[0] % 3 == 0:
-                        # The bug: a 200 that lies — buffer failed, doc serialized as null.
-                        conn.sendall(resp(200, "OK", b"null"))
-                        continue
-
-                    if mode == "stale503" and counter[0] % 3 == 0:
-                        # Wrong/old firmware: low-heap refusal as 503 instead of 429.
-                        conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
-                        continue
-
-                    busy = not serving.acquire(blocking=False)
-                    if busy:
-                        conn.sendall(resp(429, "Too Many Requests", b"Too Many Requests"))
-                        if mode == "buggy":
-                            conn.sendall(resp(200, "OK", body))  # the bug: no early return
-                        continue
-                    try:
-                        time.sleep(0.02)  # widen the window so workers actually collide
-                        conn.sendall(resp(200, "OK", body))
-                    finally:
-                        serving.release()
+                buf += chunk
+                while b"\r\n\r\n" in buf:  # GET requests have no body; blank line ends one
+                    req, buf = buf.split(b"\r\n\r\n", 1)
+                    if not respond(conn, req):
+                        return
         except OSError:
             pass
         finally:
