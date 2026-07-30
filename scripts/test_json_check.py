@@ -12,7 +12,6 @@ is the whole point):
             instead of refusing. MUST be caught — a 200 that lies about success is the
             whole point of the check (this is what ESPresense#2428 fixes in firmware).
 """
-import json
 import os
 import socket
 import sys
