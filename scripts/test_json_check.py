@@ -131,4 +131,11 @@ stale503 = run("stale503")
 assert stale503, "detector MISSED a 503 (wrong/old firmware — must be 429)"
 print(f"stale503 srv  -> detected: {stale503[0]}")
 
+# _run routing: an unexpected worker exception is a harness crash, tracked apart from
+# load-shedding drops so it can't hide behind a "clean pass with shedding".
+_bugs, _drops, _crashes = [], [], []
+hil_monitor._run(lambda n, drops: (_ for _ in ()).throw(RuntimeError("boom")), 0, _bugs, _drops, _crashes)
+assert _crashes and not _bugs and not _drops, (_bugs, _drops, _crashes)
+print("crash routing -> tracked as crash, not a drop")
+
 print("\nOK: catches double-send + 200-null, tolerates 429+drops, rejects 503, no false positives.")

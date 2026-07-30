@@ -55,76 +55,75 @@ def json_endpoint_check(ip, bug):
     shifted stream answers the wrong question, or hands back the 429 text as a 200 body.
 
     The rule is simple: a 200 must be a complete, correct JSON object for the URL that
-    asked for it. Refusing to serve under pressure is fine — 429 (busy or low heap),
-    or dropping the connection at the TCP layer (IncompleteRead / reset / refused) are all
-    acceptable load-shedding and are counted, logged, and reconnected past, never failed
-    on. But a *200* that is null, truncated, unparseable, or the wrong document is the
-    server lying about success — that is the double-send, or the low-heap null-body path
-    (fixed in firmware by refusing with 429) — and it fails the build.
+    asked for it. Refusing to serve under pressure is fine — a 429 (busy or low heap) is
+    the designed refusal and is silently accepted; anything odder that still isn't the bug
+    (a dropped TCP connection, an unexpected non-200/429 status) is counted into the
+    "shed under load" tally, logged, and reconnected past, never failed on. But a *200*
+    that is null, truncated, unparseable, or the wrong document is the server lying about
+    success — the double-send, or the low-heap null-body path (fixed in firmware by
+    refusing with 429) — and it fails the build.
     """
     TOO_MANY = b"Too Many Requests"
 
     def worker(n, drops):
         conn = None
-        for i in range(JSON_CHECK_REQUESTS):
-            path = "/json/devices" if i % 2 else "/json"
-            try:
-                if conn is None:
-                    conn = http.client.HTTPConnection(ip, timeout=10)
-                conn.request("GET", path)
-                resp = conn.getresponse()
-                body = resp.read()
-            except (OSError, http.client.HTTPException) as e:
-                # Connection-level hiccup: the node shed load. Not the bug. Reconnect.
-                drops.append(str(e))
-                if conn is not None:
-                    conn.close()
-                conn = None
-                continue
+        try:
+            for i in range(JSON_CHECK_REQUESTS):
+                path = "/json/devices" if i % 2 else "/json"
+                try:
+                    if conn is None:
+                        conn = http.client.HTTPConnection(ip, timeout=10)
+                    conn.request("GET", path)
+                    resp = conn.getresponse()
+                    body = resp.read()
+                except (OSError, http.client.HTTPException) as e:
+                    # Connection-level hiccup: the node shed load. Not the bug. Reconnect.
+                    drops.append(str(e))
+                    if conn is not None:
+                        conn.close()
+                    conn = None
+                    continue
 
-            # The firmware refuses with 429 (busy or low-heap) — that is the one accepted
-            # non-200. A 503 specifically means wrong/old firmware: the low-heap path was
-            # meant to return 503 and was deliberately changed to 429 (ESPresense#2428), so
-            # a 503 on a direct-to-device connection is a contract violation, not shedding.
-            if resp.status != 200:
-                if resp.status == 503:
-                    conn.close()
-                    raise _Bug(f"GET {path} returned 503 — firmware must refuse with 429, not 503")
-                if resp.status != 429:
-                    drops.append(f"HTTP {resp.status} on {path}")
-                continue
+                # The firmware refuses with 429 (busy or low-heap) — the one accepted
+                # non-200, and silently accepted (not counted as shedding). A 503 means
+                # wrong/old firmware: the low-heap path was deliberately changed from 503
+                # to 429 (ESPresense#2428), so a 503 on a direct connection is a contract
+                # violation, not shedding.
+                if resp.status != 200:
+                    if resp.status == 503:
+                        raise _Bug(f"GET {path} returned 503 — firmware must refuse with 429, not 503")
+                    if resp.status != 429:
+                        drops.append(f"HTTP {resp.status} on {path}")
+                    continue
 
-            # From here a 200 must be a complete, correct object — anything less is a lie.
+                # From here a 200 must be a complete, correct object — anything less is a lie.
 
-            # A 200 carrying the 429 text is the double-send caught red-handed.
-            if TOO_MANY in body:
+                # A 200 carrying the 429 text is the double-send caught red-handed.
+                if TOO_MANY in body:
+                    raise _Bug(f"GET {path} returned 200 with the 429 body {TOO_MANY!r} — "
+                               f"two responses were sent for one request")
+
+                try:
+                    doc = json.loads(body)
+                except ValueError as e:
+                    raise _Bug(f"GET {path} returned a 200 with an unparseable body "
+                               f"({len(body)}B, starts {body[:60]!r}) — truncated or garbled") from e
+
+                # A 200 that isn't a JSON object is the low-heap null-body path: the buffer
+                # failed to allocate, the doc serialized as `null`, and it shipped as 200
+                # instead of 429. That is the bug the low-heap guard fixes.
+                if not isinstance(doc, dict):
+                    raise _Bug(f"GET {path} returned a 200 with non-object JSON ({body[:40]!r}) "
+                               f"— low-heap serving should refuse (429), not 200")
+
+                # The double-send signature: a 200 whose document doesn't match the URL.
+                if ("devices" in doc) != path.endswith("/devices"):
+                    raise _Bug(f"GET {path} answered with the wrong document (keys "
+                               f"{sorted(doc)}) — a stale response is queued on this "
+                               f"connection, i.e. two responses were sent for one request")
+        finally:
+            if conn is not None:
                 conn.close()
-                raise _Bug(f"GET {path} returned 200 with the 429 body {TOO_MANY!r} — "
-                           f"two responses were sent for one request")
-
-            try:
-                doc = json.loads(body)
-            except ValueError:
-                conn.close()
-                raise _Bug(f"GET {path} returned a 200 with an unparseable body "
-                           f"({len(body)}B, starts {body[:60]!r}) — truncated or garbled")
-
-            # A 200 that isn't a JSON object is the low-heap null-body path: the buffer
-            # failed to allocate, the doc serialized as `null`, and it shipped as 200
-            # instead of 429. That is the bug the low-heap guard fixes.
-            if not isinstance(doc, dict):
-                conn.close()
-                raise _Bug(f"GET {path} returned a 200 with non-object JSON ({body[:40]!r}) "
-                           f"— low-heap serving should refuse (429), not 200")
-
-            # The double-send signature: a 200 whose document doesn't match the URL.
-            if ("devices" in doc) != path.endswith("/devices"):
-                conn.close()
-                raise _Bug(f"GET {path} answered with the wrong document (keys "
-                           f"{sorted(doc)}) — a stale response is queued on this "
-                           f"connection, i.e. two responses were sent for one request")
-        if conn is not None:
-            conn.close()
 
     time.sleep(JSON_CHECK_DELAY_SECS)
 
@@ -138,9 +137,9 @@ def json_endpoint_check(ip, bug):
         print(f"[hil] /json check SKIPPED — {ip} unreachable from the runner ({e})", flush=True)
         return
 
-    bugs, drops = [], []
+    bugs, drops, crashes = [], [], []
     threads = [
-        threading.Thread(target=lambda n=n: _run(worker, n, bugs, drops))
+        threading.Thread(target=lambda n=n: _run(worker, n, bugs, drops, crashes))
         for n in range(JSON_CHECK_WORKERS)
     ]
     for t in threads:
@@ -149,24 +148,33 @@ def json_endpoint_check(ip, bug):
         t.join()
 
     total = JSON_CHECK_WORKERS * JSON_CHECK_REQUESTS
-    shed = f" ({len(drops)}/{total} shed under load)" if drops else ""
+    notes = []
+    if drops:
+        notes.append(f"{len(drops)}/{total} shed under load")
+    if crashes:
+        notes.append(f"{len(crashes)} worker crash(es): {crashes[0]}")
+    suffix = f" ({'; '.join(notes)})" if notes else ""
     if bugs:
         bug.append(f"/json contract violation: {bugs[0]}")
+    elif crashes:
+        # A checker crash isn't a firmware failure, but it must not read as a clean pass.
+        bug.append(f"/json check harness error: {crashes[0]}")
     else:
-        print(f"[hil] /json check passed ({total} concurrent requests to {ip}){shed}", flush=True)
+        print(f"[hil] /json check passed ({total} concurrent requests to {ip}){suffix}", flush=True)
 
 
 class _Bug(Exception):
     """The double-send signature was observed — the one hard failure."""
 
 
-def _run(fn, n, bugs, drops):
+def _run(fn, n, bugs, drops, crashes):
     try:
         fn(n, drops)
     except _Bug as e:
         bugs.append(str(e))
     except Exception as e:  # noqa: BLE001 - never let a worker die silently and still "pass"
-        drops.append(f"worker {n} crashed: {type(e).__name__}: {e}")
+        # A checker crash is not load-shedding; track it apart so it can't hide in the tally.
+        crashes.append(f"worker {n}: {type(e).__name__}: {e}")
         print(f"[hil] /json worker {n} crashed: {type(e).__name__}: {e}", flush=True)
 
 
