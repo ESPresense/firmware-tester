@@ -5,10 +5,12 @@ Raw-socket mocks (BaseHTTPRequestHandler can't send two responses to one request
 is the whole point):
   buggy   - pre-fix serveJson: when busy, writes the 429 AND the 200 JSON (the bug)
   fixed   - post-fix serveJson: when busy, writes only the 429
-  flaky   - correct, but sheds load like a real constrained node: drops keep-alive
-            connections mid-body, and occasionally returns a bare `null`. This is the
-            case that made HIL red on 2026-07-30 with the first version of the check;
-            it MUST pass.
+  flaky   - correct load-shedding a real constrained node does: drops keep-alive
+            connections mid-body, and returns 503 when it can't afford the buffer.
+            MUST pass — refusing to serve is fine.
+  oom     - the low-heap null-body bug: under pressure returns a 200 with body `null`
+            instead of a 503. MUST be caught — a 200 that lies about success is the
+            whole point of the check (this is what ESPresense#2428 fixes in firmware).
 """
 import json
 import os
@@ -50,13 +52,18 @@ def serve(sock, mode, stop):
                     counter[0] += 1
 
                     if mode == "flaky":
-                        # Load-shedding a real node does, none of which is the bug:
+                        # Correct load-shedding — refusing to serve, never a false 200:
                         if counter[0] % 4 == 0:
                             conn.close()  # drop keep-alive mid-stream -> IncompleteRead/reset
                             return
                         if counter[0] % 7 == 0:
-                            conn.sendall(resp(200, "OK", b"null"))  # odd but not a shift
+                            conn.sendall(resp(503, "Service Unavailable", b'{"error":"low memory"}'))
                             continue
+
+                    if mode == "oom" and counter[0] % 3 == 0:
+                        # The bug: a 200 that lies — buffer failed, doc serialized as null.
+                        conn.sendall(resp(200, "OK", b"null"))
+                        continue
 
                     busy = not serving.acquire(blocking=False)
                     if busy:
@@ -108,6 +115,10 @@ print("fixed server  -> clean")
 
 flaky = run("flaky")
 assert not flaky, f"detector false-positived on load-shedding node: {flaky}"
-print("flaky server  -> clean (drops + null bodies tolerated)")
+print("flaky server  -> clean (drops + 503 tolerated)")
 
-print("\nOK: catches the bug, ignores load-shedding, no false positives.")
+oom = run("oom")
+assert oom, "detector MISSED the low-heap 200-null body"
+print(f"oom server    -> detected: {oom[0]}")
+
+print("\nOK: catches double-send + 200-null, tolerates 429/503/drops, no false positives.")

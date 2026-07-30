@@ -54,10 +54,13 @@ def json_endpoint_check(ip, bug):
     endpoints with different shapes: /json has no "devices" key, /json/devices does. A
     shifted stream answers the wrong question, or hands back the 429 text as a 200 body.
 
-    Everything else a memory-constrained node does under a burst of concurrent requests —
-    429s, dropping a keep-alive connection mid-body (IncompleteRead), refusing to connect —
-    is acceptable load-shedding, not a firmware bug. Those are counted and logged, never
-    failed on; the worker just reconnects and continues.
+    The rule is simple: a 200 must be a complete, correct JSON object for the URL that
+    asked for it. Refusing to serve under pressure is fine — 429 (busy), 503 (low heap),
+    or dropping the connection at the TCP layer (IncompleteRead / reset / refused) are all
+    acceptable load-shedding and are counted, logged, and reconnected past, never failed
+    on. But a *200* that is null, truncated, unparseable, or the wrong document is the
+    server lying about success — that is the double-send, or the low-heap null-body path
+    (fixed by returning 503) — and it fails the build.
     """
     TOO_MANY = b"Too Many Requests"
 
@@ -79,11 +82,13 @@ def json_endpoint_check(ip, bug):
                 conn = None
                 continue
 
-            if resp.status == 429:
-                continue
+            # Refusing to serve is acceptable: 429 busy, 503 low-heap, anything non-200.
             if resp.status != 200:
-                drops.append(f"HTTP {resp.status} on {path}")
+                if resp.status not in (429, 503):
+                    drops.append(f"HTTP {resp.status} on {path}")
                 continue
+
+            # From here a 200 must be a complete, correct object — anything less is a lie.
 
             # A 200 carrying the 429 text is the double-send caught red-handed.
             if TOO_MANY in body:
@@ -94,12 +99,20 @@ def json_endpoint_check(ip, bug):
             try:
                 doc = json.loads(body)
             except ValueError:
-                # Garbled/partial body under load, but not the 429-text signature.
-                drops.append(f"unparseable 200 body on {path} ({len(body)}B)")
-                continue
+                conn.close()
+                raise _Bug(f"GET {path} returned a 200 with an unparseable body "
+                           f"({len(body)}B, starts {body[:60]!r}) — truncated or garbled")
 
-            # The signature: a 200 whose document doesn't match the URL that asked for it.
-            if isinstance(doc, dict) and (("devices" in doc) != path.endswith("/devices")):
+            # A 200 that isn't a JSON object is the low-heap null-body path: the buffer
+            # failed to allocate, the doc serialized as `null`, and it shipped as 200
+            # instead of 503. That is the bug the 503 guard fixes.
+            if not isinstance(doc, dict):
+                conn.close()
+                raise _Bug(f"GET {path} returned a 200 with non-object JSON ({body[:40]!r}) "
+                           f"— low-heap serving should 503, not 200")
+
+            # The double-send signature: a 200 whose document doesn't match the URL.
+            if ("devices" in doc) != path.endswith("/devices"):
                 conn.close()
                 raise _Bug(f"GET {path} answered with the wrong document (keys "
                            f"{sorted(doc)}) — a stale response is queued on this "
@@ -132,7 +145,7 @@ def json_endpoint_check(ip, bug):
     total = JSON_CHECK_WORKERS * JSON_CHECK_REQUESTS
     shed = f" ({len(drops)}/{total} shed under load)" if drops else ""
     if bugs:
-        bug.append(f"/json double-send: {bugs[0]}")
+        bug.append(f"/json returned a bad 200: {bugs[0]}")
     else:
         print(f"[hil] /json check passed ({total} concurrent requests to {ip}){shed}", flush=True)
 
