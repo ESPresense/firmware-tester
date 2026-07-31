@@ -50,11 +50,16 @@ JSON_CHECK_DELAY_SECS = 15  # let the web server settle after boot
 JSON_CHECK_WORKERS = 3      # concurrent connections — enough to reliably collide on serveJson
 JSON_CHECK_REQUESTS = 12    # sequential requests per worker, on one kept-alive connection
 
-# Heap trend. /json already reports freeHeap/maxHeap/fingerprints, so sampling it needs no
-# firmware change. A leak shows as freeHeap sliding while fingerprints stays flat; a
-# fragmentation problem shows as maxHeap sliding while freeHeap holds; fingerprint churn
-# shows as both moving with the device count. All three are printed so the log answers
-# which one it is without a re-run.
+# Heap trend, sampled from /json/tele. Deliberately not /json: that endpoint refuses with
+# 429 when it cannot afford a 12KB document, so heap numbers hung off it would vanish
+# exactly as a node degraded — the samples would stop before the decline they are meant to
+# measure and the verdict below would compare a healthier window. /json/tele is
+# allocation-free and answers at any heap level.
+#
+# A leak shows as freeHeap sliding while fingerprints stays flat; a fragmentation problem
+# shows as maxHeap sliding while freeHeap holds; fingerprint churn shows as both moving
+# with the device count. All three are printed so the log answers which without a re-run.
+HEAP_TELE_PATH = "/json/tele"
 HEAP_SAMPLE_SECS = 60
 HEAP_SETTLE_SECS = 120        # ignore the post-boot allocation burst
 HEAP_TREND_MIN_SECS = 1800    # below this the window is too short for a slope to mean anything
@@ -184,8 +189,8 @@ def json_endpoint_check(ip, bug):
         print(f"[hil] /json check passed ({total} concurrent requests to {ip}){suffix}", flush=True)
 
 
-def heap_sampler(ip, samples, stop):
-    """Poll /json every HEAP_SAMPLE_SECS and record freeHeap/maxHeap/fingerprints.
+def heap_sampler(ip, samples, stop, problems):
+    """Poll /json/tele every HEAP_SAMPLE_SECS and record freeHeap/maxHeap/fingerprints.
 
     Read-only and deliberately gentle — one request a minute is nothing next to the
     concurrent burst json_endpoint_check already fires. Failures to sample are skipped
@@ -196,10 +201,18 @@ def heap_sampler(ip, samples, stop):
     while not stop.is_set():
         try:
             conn = http.client.HTTPConnection(ip, timeout=10)
-            conn.request("GET", "/json")
+            conn.request("GET", HEAP_TELE_PATH)
             resp = conn.getresponse()
             body = resp.read()
             conn.close()
+            if resp.status == 404:
+                # Firmware predates the endpoint. Recorded rather than ignored: a heap check
+                # that quietly samples nothing is worse than no check, because the run still
+                # reports PASS.
+                if "missing" not in problems:
+                    problems.append("missing")
+                    print(f"[hil] {HEAP_TELE_PATH} returned 404 — firmware too old", flush=True)
+                return
             if resp.status == 200:
                 doc = json.loads(body)
                 free, mx = doc.get("freeHeap"), doc.get("maxHeap")
@@ -212,11 +225,17 @@ def heap_sampler(ip, samples, stop):
         stop.wait(HEAP_SAMPLE_SECS)
 
 
-def heap_verdict(samples, duration):
+def heap_verdict(samples, duration, problems=()):
     """Return a failure string if free heap trended down over the run, else None."""
     if duration < HEAP_TREND_MIN_SECS:
         return None  # a 3-minute PR run says nothing about a multi-hour slope
+    if "missing" in problems:
+        # Not a heap failure, but the run cannot claim to have checked heap either.
+        return (f"{HEAP_TELE_PATH} is missing from this firmware, so heap was never "
+                f"sampled over {format_duration(int(duration))}")
     if len(samples) < HEAP_TREND_EDGE * 2:
+        # Unreachable-from-runner looks the same as a quiet network; neither is a firmware
+        # fault, so this stays a skip. A 404 is handled above precisely because it is one.
         print(f"[hil] heap trend SKIPPED — only {len(samples)} samples", flush=True)
         return None
 
@@ -299,7 +318,8 @@ def main():
     booted = False
     saw_scan_result = False
     json_failure = []  # appended to by the /json check thread
-    heap_samples = []  # appended to by the heap sampler thread
+    heap_samples = []   # appended to by the heap sampler thread
+    heap_problems = []  # ditto, for "the check could not run" conditions
     stop_sampling = threading.Event()
 
     try:
@@ -320,7 +340,7 @@ def main():
                     )
                     sys.exit(4)
                 stop_sampling.set()
-                decline = heap_verdict(heap_samples, elapsed)
+                decline = heap_verdict(heap_samples, elapsed, heap_problems)
                 if decline:
                     print(f"FAIL: {decline}")
                     sys.exit(8)
@@ -359,7 +379,7 @@ def main():
                     ).start()
                     threading.Thread(
                         target=heap_sampler,
-                        args=(match.group(1), heap_samples, stop_sampling),
+                        args=(match.group(1), heap_samples, stop_sampling, heap_problems),
                         daemon=True,
                     ).start()
                 else:

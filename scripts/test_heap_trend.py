@@ -56,4 +56,15 @@ assert heap_verdict(samples(ramp(85000, 33000, 360)), 180) is None, "short run m
 assert heap_verdict(samples(ramp(85000, 33000, 8)), HOURS_6) is None, "too few samples to judge"
 print("short run -> skipped")
 
+# Firmware without /json/tele must fail loudly. A heap check that silently samples nothing
+# and still reports PASS is how #2309 survived an 8h soak in the first place.
+verdict = heap_verdict([], HOURS_6, ["missing"])
+assert verdict and "missing" in verdict, f"old firmware not flagged: {verdict!r}"
+print(f"no endpoint -> {verdict}")
+
+# But a node the runner simply cannot reach is not a firmware fault — still a skip.
+assert heap_verdict([], HOURS_6) is None, "unreachable node must not fail the build"
+assert heap_verdict([], 180, ["missing"]) is None, "short run still must not judge"
+print("unreachable -> skipped")
+
 print("all heap trend checks passed")

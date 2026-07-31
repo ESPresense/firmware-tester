@@ -22,6 +22,7 @@ import ctypes
 import fcntl
 import os
 import secrets
+import select
 import socket
 import struct
 import time
@@ -32,6 +33,9 @@ HCI_CHANNEL_USER = 1
 HCIDEVDOWN = 0x400448CA
 
 HCI_COMMAND_PKT = 0x01
+HCI_EVENT_PKT = 0x04
+EVT_CMD_COMPLETE = 0x0E
+EVT_CMD_STATUS = 0x0F
 
 OCF_RESET = 0x0C03
 OCF_LE_SET_RANDOM_ADDRESS = 0x2005
@@ -67,8 +71,19 @@ def random_static_address():
             return bytes(addr)
 
 
-def advertising_payload(name=b"HIL-FLOOD"):
-    """A minimal but realistic non-connectable advert: flags + complete local name."""
+def advertising_payload(address):
+    """Flags + a complete local name that is unique to this address.
+
+    The name must vary per rotation. ESPresense ranks a name (ID_TYPE_NAME, 35) above a
+    static random address (ID_TYPE_RAND_STATIC_MAC, 5), so a constant name would collapse
+    every advert in the flood onto one logical id — the slot pool would still churn, but
+    the id space this is meant to exercise would not. Confirmed on a live node, which
+    reported two different MACs both as id "name:hil-flood".
+
+    The full MAC goes in the name rather than a short suffix: at 40/s a 3-byte suffix
+    collides tens of thousands of times over an 8h soak, quietly merging ids again.
+    """
+    name = b"HIL-" + address[::-1].hex().encode()  # MSB-first, matching how nodes show it
     fields = bytes([2, 0x01, 0x06]) + bytes([len(name) + 1, 0x09]) + name
     if len(fields) > 31:
         raise ValueError(f"advertising payload too long: {len(fields)}")
@@ -118,20 +133,50 @@ def open_adapter(index):
     return sock
 
 
-def send(sock, opcode, params=b""):
+class HciError(Exception):
+    """The controller rejected a command, or never answered one."""
+
+
+def command_status(pkt, opcode):
+    """Status byte from a Command Complete/Status event for opcode, else None."""
+    if len(pkt) < 6 or pkt[0] != HCI_EVENT_PKT:
+        return None
+    if pkt[1] == EVT_CMD_COMPLETE:  # type, 0x0e, plen, ncmd, opcode(2), status
+        if struct.unpack_from("<H", pkt, 4)[0] != opcode:
+            return None
+        return pkt[6] if len(pkt) > 6 else 0x00
+    if pkt[1] == EVT_CMD_STATUS:    # type, 0x0f, plen, status, ncmd, opcode(2)
+        if len(pkt) < 7 or struct.unpack_from("<H", pkt, 5)[0] != opcode:
+            return None
+        return pkt[3]
+    return None
+
+
+def send(sock, opcode, params=b"", timeout=2.0):
+    """Send one command and confirm the controller accepted it.
+
+    Waiting for the completion event is what makes a run mean something: without it a
+    wedged or unplugged adapter silently swallows every command and the flood reports
+    thousands of addresses while radiating nothing at all.
+    """
     sock.sendall(hci_command(opcode, params))
-    drain(sock)
-
-
-def drain(sock):
-    """Consume controller events. Unread events eventually stall the socket."""
+    deadline = time.monotonic() + timeout
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HciError(f"opcode 0x{opcode:04x}: no completion event within {timeout}s")
+        if not select.select([sock], [], [], remaining)[0]:
+            continue
         try:
-            sock.recv(1024)
+            pkt = sock.recv(258)
         except BlockingIOError:
-            return
-        except OSError:
-            return
+            continue
+        status = command_status(pkt, opcode)
+        if status is None:
+            continue  # an unrelated event (advertising reports etc.) — keep draining
+        if status != 0x00:
+            raise HciError(f"opcode 0x{opcode:04x} rejected with status 0x{status:02x}")
+        return
 
 
 def flood_requested(flag_dir, max_age):
@@ -169,7 +214,6 @@ def flood(sock, rate, flag_dir, max_age, stop_after):
     send(sock, OCF_RESET)
     time.sleep(0.1)
     send(sock, OCF_LE_SET_ADV_PARAMETERS, adv_parameters())
-    send(sock, OCF_LE_SET_ADV_DATA, advertising_payload())
 
     interval = 1.0 / rate
     started = time.monotonic()
@@ -191,8 +235,10 @@ def flood(sock, rate, flag_dir, max_age, stop_after):
             print(f"[flood] resumed — request present in {flag_dir}", flush=True)
 
         cycle = time.monotonic()
+        address = random_static_address()
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x00")
-        send(sock, OCF_LE_SET_RANDOM_ADDRESS, random_static_address())
+        send(sock, OCF_LE_SET_RANDOM_ADDRESS, address)
+        send(sock, OCF_LE_SET_ADV_DATA, advertising_payload(address))
         send(sock, OCF_LE_SET_ADV_ENABLE, b"\x01")
         advertising = True
         rotations += 1
@@ -226,8 +272,15 @@ def selftest():
 
     assert len({random_static_address() for _ in range(5000)}) == 5000, "addresses repeat"
 
-    payload = advertising_payload()
-    assert len(payload) == 32 and payload[0] == 14, payload.hex()
+    # Every advert must carry an identity unique to its address, or ESPresense merges them.
+    addr_a, addr_b = random_static_address(), random_static_address()
+    payload = advertising_payload(addr_a)
+    assert len(payload) == 32, len(payload)
+    assert payload[0] == 21 and payload[1:4] == b"\x02\x01\x06", payload.hex()
+    assert payload[4:6] == b"\x11\x09", payload.hex()  # 16-byte name, "complete local name"
+    assert payload[6:22] == b"HIL-" + addr_a[::-1].hex().encode(), payload.hex()
+    assert advertising_payload(addr_b) != payload, "payload must vary with the address"
+    assert len({advertising_payload(random_static_address()) for _ in range(2000)}) == 2000
     assert len(adv_parameters()) == 15, len(adv_parameters())
 
     try:
@@ -235,6 +288,24 @@ def selftest():
         raise AssertionError("oversized parameters must be rejected")
     except ValueError:
         pass
+
+    # Completion parsing decides whether a rejected command is noticed at all. If this
+    # goes wrong the flood happily reports thousands of addresses while radiating none.
+    op = OCF_LE_SET_ADV_ENABLE
+    complete_ok = bytes([HCI_EVENT_PKT, EVT_CMD_COMPLETE, 4, 1]) + struct.pack("<H", op) + b"\x00"
+    complete_bad = bytes([HCI_EVENT_PKT, EVT_CMD_COMPLETE, 4, 1]) + struct.pack("<H", op) + b"\x12"
+    status_ok = bytes([HCI_EVENT_PKT, EVT_CMD_STATUS, 4, 0x00, 1]) + struct.pack("<H", op)
+    status_bad = bytes([HCI_EVENT_PKT, EVT_CMD_STATUS, 4, 0x0C, 1]) + struct.pack("<H", op)
+    other_op = bytes([HCI_EVENT_PKT, EVT_CMD_COMPLETE, 4, 1]) + struct.pack("<H", OCF_RESET) + b"\x00"
+    adv_report = bytes([HCI_EVENT_PKT, 0x3E, 12]) + b"\x02" * 12
+
+    assert command_status(complete_ok, op) == 0x00
+    assert command_status(complete_bad, op) == 0x12
+    assert command_status(status_ok, op) == 0x00
+    assert command_status(status_bad, op) == 0x0C
+    assert command_status(other_op, op) is None, "another command's reply must not be claimed"
+    assert command_status(adv_report, op) is None, "an advertising report is not a completion"
+    assert command_status(b"", op) is None and command_status(b"\x04\x0e", op) is None
 
     # The gate decides whether the bench sprays junk MACs across the house, so both
     # directions matter: it must come on for a live step and go off for a dead one.
