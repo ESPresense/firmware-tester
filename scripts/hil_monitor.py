@@ -63,7 +63,7 @@ HEAP_TELE_PATH = "/json/tele"
 HEAP_SAMPLE_SECS = 60
 HEAP_SETTLE_SECS = 120        # ignore the post-boot allocation burst
 HEAP_TREND_MIN_SECS = 1800    # below this the window is too short for a slope to mean anything
-HEAP_TREND_EDGE = 5           # samples averaged at each end
+HEAP_TREND_EDGE = 5           # samples used for the median at each end
 HEAP_DECLINE_FRAC = 0.25      # fail if the tail lost more than this much of the baseline
 
 
@@ -215,11 +215,14 @@ def heap_sampler(ip, samples, stop, problems):
                 return
             if resp.status == 200:
                 doc = json.loads(body)
-                free, mx = doc.get("freeHeap"), doc.get("maxHeap")
-                if isinstance(free, int) and isinstance(mx, int):
-                    fp = doc.get("fingerprints")
-                    samples.append((time.monotonic(), free, mx, fp))
-                    print(f"[hil] heap freeHeap={free} maxHeap={mx} fingerprints={fp}", flush=True)
+                # A null/non-object body is the low-heap path (see json_endpoint_check) — the
+                # exact moment this sampler must not die on `None.get(...)`. Skip the sample.
+                if isinstance(doc, dict):
+                    free, mx = doc.get("freeHeap"), doc.get("maxHeap")
+                    if isinstance(free, int) and isinstance(mx, int):
+                        fp = doc.get("fingerprints")
+                        samples.append((time.monotonic(), free, mx, fp))
+                        print(f"[hil] heap freeHeap={free} maxHeap={mx} fingerprints={fp}", flush=True)
         except (OSError, http.client.HTTPException, ValueError):
             pass  # a missed sample is not a measurement — see docstring
         stop.wait(HEAP_SAMPLE_SECS)
@@ -247,8 +250,9 @@ def heap_verdict(samples, duration, problems=()):
     free0, free1 = edges(1)
     max0, max1 = edges(2)
     fp0, fp1 = samples[0][3], samples[-1][3]
+    span = samples[-1][0] - samples[0][0]  # actual sampled window, not the full monitor duration
     summary = (f"freeHeap {free0:.0f}->{free1:.0f}, maxHeap {max0:.0f}->{max1:.0f}, "
-               f"fingerprints {fp0}->{fp1}, over {format_duration(int(duration))}")
+               f"fingerprints {fp0}->{fp1}, over {format_duration(int(span))}")
 
     if free1 < free0 * (1 - HEAP_DECLINE_FRAC):
         lost = (1 - free1 / free0) * 100
