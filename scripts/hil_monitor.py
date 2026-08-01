@@ -10,12 +10,15 @@ Exit codes:
   4 = no scan results seen
   5 = firmware MQTT reconnect limit reached
   6 = /json endpoint misbehaved under concurrent load
+  7 = node restarted mid-run
+  8 = free heap declined over the run
 """
 
 import argparse
 import http.client
 import json
 import re
+import statistics
 import sys
 import threading
 import time
@@ -35,10 +38,33 @@ BOOT_TIMEOUT_SECS = 90
 MQTT_RECONNECT_LIMIT_PATTERN = "Too many reconnect attempts; Restarting"
 DEFAULT_SCAN_RESULT_PATTERN = r"^\s*\d+\s+\w+\s+\|"
 
+# setup() prints this on every boot. Seeing it *after* boot was confirmed means the node
+# went down and came back — a silent restart loop otherwise passes the whole window,
+# because every other check here is satisfied by the fresh boot (ESPresense#2309).
+REBOOT_PATTERN = "Pre-Setup Free Mem:"
+# The firmware's own low-heap watchdog announcing a restart. Same failure, better message.
+OOM_RESTART_PATTERN = "Out of memory for"
+
 IP_PATTERN = re.compile(r"IP address:\s*(\d+\.\d+\.\d+\.\d+)")
 JSON_CHECK_DELAY_SECS = 15  # let the web server settle after boot
 JSON_CHECK_WORKERS = 3      # concurrent connections — enough to reliably collide on serveJson
 JSON_CHECK_REQUESTS = 12    # sequential requests per worker, on one kept-alive connection
+
+# Heap trend, sampled from /json/tele. Deliberately not /json: that endpoint refuses with
+# 429 when it cannot afford a 12KB document, so heap numbers hung off it would vanish
+# exactly as a node degraded — the samples would stop before the decline they are meant to
+# measure and the verdict below would compare a healthier window. /json/tele is
+# allocation-free and answers at any heap level.
+#
+# A leak shows as freeHeap sliding while fingerprints stays flat; a fragmentation problem
+# shows as maxHeap sliding while freeHeap holds; fingerprint churn shows as both moving
+# with the device count. All three are printed so the log answers which without a re-run.
+HEAP_TELE_PATH = "/json/tele"
+HEAP_SAMPLE_SECS = 60
+HEAP_SETTLE_SECS = 120        # ignore the post-boot allocation burst
+HEAP_TREND_MIN_SECS = 1800    # below this the window is too short for a slope to mean anything
+HEAP_TREND_EDGE = 5           # samples used for the median at each end
+HEAP_DECLINE_FRAC = 0.25      # fail if the tail lost more than this much of the baseline
 
 
 def json_endpoint_check(ip, bug):
@@ -163,6 +189,78 @@ def json_endpoint_check(ip, bug):
         print(f"[hil] /json check passed ({total} concurrent requests to {ip}){suffix}", flush=True)
 
 
+def heap_sampler(ip, samples, stop, problems):
+    """Poll /json/tele every HEAP_SAMPLE_SECS and record freeHeap/maxHeap/fingerprints.
+
+    Read-only and deliberately gentle — one request a minute is nothing next to the
+    concurrent burst json_endpoint_check already fires. Failures to sample are skipped
+    rather than recorded: a missed poll is a network hiccup, not a heap measurement, and
+    inventing a zero here would read as a catastrophic leak.
+    """
+    stop.wait(HEAP_SETTLE_SECS)
+    while not stop.is_set():
+        try:
+            conn = http.client.HTTPConnection(ip, timeout=10)
+            conn.request("GET", HEAP_TELE_PATH)
+            resp = conn.getresponse()
+            body = resp.read()
+            conn.close()
+            if resp.status == 404:
+                # Firmware predates the endpoint. Recorded rather than ignored: a heap check
+                # that quietly samples nothing is worse than no check, because the run still
+                # reports PASS.
+                if "missing" not in problems:
+                    problems.append("missing")
+                    print(f"[hil] {HEAP_TELE_PATH} returned 404 — firmware too old", flush=True)
+                return
+            if resp.status == 200:
+                doc = json.loads(body)
+                # A null/non-object body is the low-heap path (see json_endpoint_check) — the
+                # exact moment this sampler must not die on `None.get(...)`. Skip the sample.
+                if isinstance(doc, dict):
+                    free, mx = doc.get("freeHeap"), doc.get("maxHeap")
+                    if isinstance(free, int) and isinstance(mx, int):
+                        fp = doc.get("fingerprints")
+                        samples.append((time.monotonic(), free, mx, fp))
+                        print(f"[hil] heap freeHeap={free} maxHeap={mx} fingerprints={fp}", flush=True)
+        except (OSError, http.client.HTTPException, ValueError):
+            pass  # a missed sample is not a measurement — see docstring
+        stop.wait(HEAP_SAMPLE_SECS)
+
+
+def heap_verdict(samples, duration, problems=()):
+    """Return a failure string if free heap trended down over the run, else None."""
+    if duration < HEAP_TREND_MIN_SECS:
+        return None  # a 3-minute PR run says nothing about a multi-hour slope
+    if "missing" in problems:
+        # Not a heap failure, but the run cannot claim to have checked heap either.
+        return (f"{HEAP_TELE_PATH} is missing from this firmware, so heap was never "
+                f"sampled over {format_duration(int(duration))}")
+    if len(samples) < HEAP_TREND_EDGE * 2:
+        # Unreachable-from-runner looks the same as a quiet network; neither is a firmware
+        # fault, so this stays a skip. A 404 is handled above precisely because it is one.
+        print(f"[hil] heap trend SKIPPED — only {len(samples)} samples", flush=True)
+        return None
+
+    def edges(index):
+        head = statistics.median(s[index] for s in samples[:HEAP_TREND_EDGE])
+        tail = statistics.median(s[index] for s in samples[-HEAP_TREND_EDGE:])
+        return head, tail
+
+    free0, free1 = edges(1)
+    max0, max1 = edges(2)
+    fp0, fp1 = samples[0][3], samples[-1][3]
+    span = samples[-1][0] - samples[0][0]  # actual sampled window, not the full monitor duration
+    summary = (f"freeHeap {free0:.0f}->{free1:.0f}, maxHeap {max0:.0f}->{max1:.0f}, "
+               f"fingerprints {fp0}->{fp1}, over {format_duration(int(span))}")
+
+    if free1 < free0 * (1 - HEAP_DECLINE_FRAC):
+        lost = (1 - free1 / free0) * 100
+        return f"Free heap fell {lost:.0f}% ({summary})"
+    print(f"[hil] heap trend OK ({summary})", flush=True)
+    return None
+
+
 class _Bug(Exception):
     """A /json contract violation that must fail the build."""
 
@@ -224,6 +322,9 @@ def main():
     booted = False
     saw_scan_result = False
     json_failure = []  # appended to by the /json check thread
+    heap_samples = []   # appended to by the heap sampler thread
+    heap_problems = []  # ditto, for "the check could not run" conditions
+    stop_sampling = threading.Event()
 
     try:
         while True:
@@ -242,6 +343,11 @@ def main():
                         f"{format_duration(args.duration)}."
                     )
                     sys.exit(4)
+                stop_sampling.set()
+                decline = heap_verdict(heap_samples, elapsed, heap_problems)
+                if decline:
+                    print(f"FAIL: {decline}")
+                    sys.exit(8)
                 print(f"PASS: {format_duration(args.duration)} elapsed cleanly.")
                 sys.exit(0)
 
@@ -269,14 +375,28 @@ def main():
                 print(f"[hil] Boot confirmed at {elapsed:.1f}s")
                 match = IP_PATTERN.search(line)
                 if match:
-                    # Background thread so the serial buffer keeps draining while we probe.
+                    # Background threads so the serial buffer keeps draining while we probe.
                     threading.Thread(
                         target=json_endpoint_check,
                         args=(match.group(1), json_failure),
                         daemon=True,
                     ).start()
+                    threading.Thread(
+                        target=heap_sampler,
+                        args=(match.group(1), heap_samples, stop_sampling, heap_problems),
+                        daemon=True,
+                    ).start()
                 else:
                     print(f"[hil] /json check SKIPPED — no IP in {line!r}")
+
+            # A restart after boot resets every other signal here — fresh boot, fresh heap,
+            # fresh scan results — so without this the window passes while the node is
+            # actually power-cycling every few hours (ESPresense#2309 on the S3).
+            elif booted and (REBOOT_PATTERN in line or OOM_RESTART_PATTERN in line):
+                why = ("firmware low-heap watchdog fired" if OOM_RESTART_PATTERN in line
+                       else "unexpected restart")
+                print(f"FAIL: Node restarted {elapsed:.0f}s into the run — {why}: {line.strip()!r}")
+                sys.exit(7)
 
             if MQTT_RECONNECT_LIMIT_PATTERN in line:
                 print(f"FAIL: Firmware MQTT reconnect limit reached: '{MQTT_RECONNECT_LIMIT_PATTERN}'")

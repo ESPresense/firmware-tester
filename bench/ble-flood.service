@@ -1,0 +1,24 @@
+[Unit]
+Description=BLE advertisement flood for the ESPresense HIL bench
+Documentation=https://github.com/ESPresense/firmware-tester
+After=network.target
+
+[Service]
+# Runs continuously but only advertises while a HIL step asks for it. Steps already
+# bind-mount /var/lock/woodpecker, so each one drops a request file there and removes it on
+# exit — no host access, no extra plumbing, and the bench is quiet between runs instead of
+# filling every ESPresense node in the house with junk fingerprints.
+ExecStart=/usr/local/bin/ble_flood.py --index 0 --rate 40 --flag-dir /var/lock/woodpecker/bleflood.d
+Restart=always
+RestartSec=5
+# HCI_CHANNEL_USER needs CAP_NET_ADMIN and an adapter no one else has powered up.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lock/woodpecker
+
+[Install]
+WantedBy=multi-user.target
