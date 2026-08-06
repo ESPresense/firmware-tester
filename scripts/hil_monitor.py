@@ -66,6 +66,18 @@ HEAP_TREND_MIN_SECS = 1800    # below this the window is too short for a slope t
 HEAP_TREND_EDGE = 5           # samples used for the median at each end
 HEAP_DECLINE_FRAC = 0.25      # fail if the tail lost more than this much of the baseline
 
+# DMA-leak bisect (ESPresense#2309, --dma-bisect). The DIAG_DMA_LEAK firmware prints the
+# internal-DMA pool (0x1800) — the exact pool the S3 leak drains, unspillable to PSRAM — to
+# serial every 5s. We read it from serial, not /json/tele: it keeps reporting even when the
+# heap is too low to serve a response. The run splits in two: arm A (BLE flood only) for the
+# first half, then arm B adds a browser-like /json hammer for the second half. Comparing the
+# dmaFree slope across the two arms answers whether the browser load is what steepens the
+# decline. Diagnostic only — this never fails the build.
+DMALEAK_PATTERN = re.compile(r"\[DMALEAK\]\s+t=(\d+)\s+dmaFree=(\d+)")
+DMA_LOAD_PATH = "/json"       # the heavy 12KB endpoint a browser polls (not /json/tele)
+DMA_LOAD_WORKERS = 4          # concurrent GETs in arm B — browser-like, a bit harder
+DMA_SETTLE_SECS = 120         # skip the post-boot allocation burst when fitting arm A
+
 
 def json_endpoint_check(ip, bug):
     """Detect the serveJson() double-send under concurrent load.
@@ -261,6 +273,65 @@ def heap_verdict(samples, duration, problems=()):
     return None
 
 
+def json_load(ip, stop):
+    """Hammer the heavy /json endpoint to mimic a browser polling it — the 'browser
+    accelerates the leak' arm of the #2309 bisect. Errors are swallowed: the point is
+    TCP/heap pressure, not correctness (json_endpoint_check already owns that)."""
+    while not stop.is_set():
+        try:
+            conn = http.client.HTTPConnection(ip, timeout=10)
+            conn.request("GET", DMA_LOAD_PATH)
+            conn.getresponse().read()
+            conn.close()
+        except (OSError, http.client.HTTPException):
+            pass
+        stop.wait(0.25)
+
+
+def dma_load_arm(ip, duration, load_on, stop):
+    """Idle for the first half of the run (arm A: BLE-flood-only baseline), then flip load_on
+    and spawn the /json hammer for the second half (arm B). Samples tag themselves with
+    load_on, so the A/B split is exact — no clock reconciliation with the device."""
+    if stop.wait(duration / 2):
+        return  # run ended before we reached arm B
+    load_on.set()
+    print(f"[hil] DMA bisect: arm B — {DMA_LOAD_WORKERS}x {DMA_LOAD_PATH} load at midpoint", flush=True)
+    for _ in range(DMA_LOAD_WORKERS):
+        threading.Thread(target=json_load, args=(ip, stop), daemon=True).start()
+
+
+def _ols_slope_per_hour(points):
+    """Least-squares slope of (t_seconds, dmaFree) in bytes/hour. stdlib only — no numpy."""
+    n = len(points)
+    if n < 2:
+        return None
+    mean_t = sum(t for t, _ in points) / n
+    mean_v = sum(v for _, v in points) / n
+    denom = sum((t - mean_t) ** 2 for t, _ in points)
+    if denom == 0:
+        return None
+    return (sum((t - mean_t) * (v - mean_v) for t, v in points) / denom) * 3600
+
+
+def dma_bisect_report(dma_samples):
+    """Print the internal-DMA slope for arm A (BLE only) vs arm B (+browser /json). A steeper
+    (more negative) arm-B slope is the browser-accelerated leak reproduced. Diagnostic only —
+    #2309; never fails the build."""
+    if len(dma_samples) < 4:
+        print(f"[hil] DMA bisect SKIPPED — only {len(dma_samples)} DMALEAK samples", flush=True)
+        return
+    t0 = dma_samples[0][0]
+    arm_a = [(t, v) for t, v, load in dma_samples if not load and t - t0 >= DMA_SETTLE_SECS]
+    arm_b = [(t, v) for t, v, load in dma_samples if load]
+    sa = _ols_slope_per_hour(arm_a)
+    sb = _ols_slope_per_hour(arm_b)
+    fmt = lambda s: "n/a" if s is None else f"{s:+.0f} B/h"
+    print(f"[hil] DMA bisect (#2309): arm A (BLE only, {len(arm_a)} samples) {fmt(sa)}  |  "
+          f"arm B (+browser /json, {len(arm_b)} samples) {fmt(sb)}", flush=True)
+    if sa is not None and sb is not None:
+        print(f"[hil] DMA bisect: browser load shifted the dmaFree slope by {sb - sa:+.0f} B/h", flush=True)
+
+
 class _Bug(Exception):
     """A /json contract violation that must fail the build."""
 
@@ -304,6 +375,13 @@ def main():
         action="store_true",
         help="Pass even if no scan result lines are seen",
     )
+    parser.add_argument(
+        "--dma-bisect",
+        action="store_true",
+        help="ESPresense#2309: split the run into BLE-only then +browser-/json arms and "
+             "report the internal-DMA (dmaFree) slope of each. Needs a DIAG_DMA_LEAK build. "
+             "Diagnostic only — never fails the build.",
+    )
     args = parser.parse_args()
     try:
         scan_result_pattern = re.compile(args.scan_pattern)
@@ -325,6 +403,8 @@ def main():
     heap_samples = []   # appended to by the heap sampler thread
     heap_problems = []  # ditto, for "the check could not run" conditions
     stop_sampling = threading.Event()
+    dma_samples = []          # (device_t, dmaFree, under_load) from DMALEAK serial lines
+    dma_load_on = threading.Event()  # set by dma_load_arm at midpoint; tags samples as arm B
 
     try:
         while True:
@@ -344,6 +424,8 @@ def main():
                     )
                     sys.exit(4)
                 stop_sampling.set()
+                if args.dma_bisect:
+                    dma_bisect_report(dma_samples)
                 decline = heap_verdict(heap_samples, elapsed, heap_problems)
                 if decline:
                     print(f"FAIL: {decline}")
@@ -386,6 +468,12 @@ def main():
                         args=(match.group(1), heap_samples, stop_sampling, heap_problems),
                         daemon=True,
                     ).start()
+                    if args.dma_bisect:
+                        threading.Thread(
+                            target=dma_load_arm,
+                            args=(match.group(1), args.duration, dma_load_on, stop_sampling),
+                            daemon=True,
+                        ).start()
                 else:
                     print(f"[hil] /json check SKIPPED — no IP in {line!r}")
 
@@ -405,6 +493,13 @@ def main():
             if not saw_scan_result and scan_result_pattern.search(line):
                 saw_scan_result = True
                 print(f"[hil] First scan result confirmed at {elapsed:.1f}s")
+
+            if args.dma_bisect:
+                dma_match = DMALEAK_PATTERN.search(line)
+                if dma_match:
+                    dma_samples.append(
+                        (int(dma_match.group(1)), int(dma_match.group(2)), dma_load_on.is_set())
+                    )
 
             for pattern in CRASH_PATTERNS:
                 if pattern in line:
