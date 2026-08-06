@@ -277,15 +277,26 @@ def json_load(ip, stop):
     """Hammer the heavy /json endpoint to mimic a browser polling it — the 'browser
     accelerates the leak' arm of the #2309 bisect. Errors are swallowed: the point is
     TCP/heap pressure, not correctness (json_endpoint_check already owns that)."""
+    conn = None
     while not stop.is_set():
         try:
-            conn = http.client.HTTPConnection(ip, timeout=10)
+            if conn is None:
+                conn = http.client.HTTPConnection(ip, timeout=10)
             conn.request("GET", DMA_LOAD_PATH)
             conn.getresponse().read()
-            conn.close()
         except (OSError, http.client.HTTPException):
-            pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            conn = None
         stop.wait(0.25)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def dma_load_arm(ip, duration, load_on, stop):
@@ -471,7 +482,7 @@ def main():
                     if args.dma_bisect:
                         threading.Thread(
                             target=dma_load_arm,
-                            args=(match.group(1), args.duration, dma_load_on, stop_sampling),
+                            args=(match.group(1), args.duration - elapsed, dma_load_on, stop_sampling),
                             daemon=True,
                         ).start()
                 else:
