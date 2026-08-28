@@ -38,8 +38,20 @@ class BadChecksum(Exception):
 
 
 def build_rpc_packet(command: int, data: bytes = b"") -> bytes:
-    payload = b"IMPROV\x01\x03" + bytes([1 + len(data), command]) + data
+    """RPC command frame: command byte, data-length byte, data."""
+    rpc_data = bytes([command, len(data)]) + data
+    payload = b"IMPROV\x01\x03" + bytes([len(rpc_data)]) + rpc_data
     return payload + bytes([sum(payload) & 0xFF])
+
+
+def decode_strings(data: bytes):
+    """Length-prefixed string list, as used by the RPC response payload."""
+    out, i = [], 0
+    while i < len(data):
+        n = data[i]
+        out.append(data[i + 1:i + 1 + n].decode("utf-8", "replace"))
+        i += 1 + n
+    return out
 
 
 def parse_improv_packet(buf: bytes):
@@ -89,8 +101,8 @@ def request_info(ser, timeout=10):
                 ptype, _, consumed = result
                 frame = buf[buf.find(b"IMPROV"):consumed]
                 buf = buf[consumed:]
-                if ptype == 0x04:  # RPC_Response
-                    print(f"Device info: {frame[11:-1].decode('utf-8', 'replace')!r}")
+                if ptype == 0x04:  # RPC_Response: command, data length, strings
+                    print(f"Device info: {decode_strings(frame[11:-1])}")
                     return True
         time.sleep(0.1)
     print("Timeout waiting for Improv device info", file=sys.stderr)
@@ -115,7 +127,7 @@ def main():
     ser.reset_input_buffer()
 
     try:
-        if not request_info(ser):
+        if not request_info(ser, timeout=args.timeout):
             ser.close()
             return 1
     except BadChecksum as e:
