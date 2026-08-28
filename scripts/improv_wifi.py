@@ -33,10 +33,21 @@ def build_wifi_packet(ssid: str, password: str) -> bytes:
     return payload + bytes([checksum])
 
 
+class BadChecksum(Exception):
+    pass
+
+
+def build_rpc_packet(command: int, data: bytes = b"") -> bytes:
+    payload = b"IMPROV\x01\x03" + bytes([1 + len(data), command]) + data
+    return payload + bytes([sum(payload) & 0xFF])
+
+
 def parse_improv_packet(buf: bytes):
     """Try to parse an Improv packet from a buffer.
 
-    Returns (packet_type, state_byte, consumed) or None.
+    Returns (packet_type, state_byte, consumed) or None. Raises BadChecksum when the
+    frame is complete but its checksum is wrong: a firmware whose serial path mangles
+    bytes (CRLF translation, dropped bytes) must fail here, not pass by luck.
     """
     idx = buf.find(b"IMPROV")
     if idx < 0 or len(buf) < idx + 10:
@@ -53,8 +64,37 @@ def parse_improv_packet(buf: bytes):
     if len(buf) < end:
         return None
 
+    expected = sum(buf[idx:end - 1]) & 0xFF
+    if buf[end - 1] != expected:
+        raise BadChecksum(f"Improv checksum {buf[end - 1]:#x}, expected {expected:#x}")
+
     state = buf[idx + 9]
     return (packet_type, state, end)
+
+
+def request_info(ser, timeout=10):
+    """Ask for device info first: its reply carries free text (names, versions), so it
+    exercises far more byte values than a bare state packet does."""
+    ser.write(build_rpc_packet(0x03))
+    ser.flush()
+    buf = b""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if ser.in_waiting:
+            buf += ser.read(ser.in_waiting)
+            while True:
+                result = parse_improv_packet(buf)
+                if not result:
+                    break
+                ptype, _, consumed = result
+                frame = buf[:consumed]
+                buf = buf[consumed:]
+                if ptype == 0x04:  # RPC_Response
+                    print(f"Device info: {frame[11:-1].decode('utf-8', 'replace')!r}")
+                    return True
+        time.sleep(0.1)
+    print("Timeout waiting for Improv device info", file=sys.stderr)
+    return False
 
 
 def main():
@@ -74,6 +114,15 @@ def main():
     time.sleep(5)
     ser.reset_input_buffer()
 
+    try:
+        if not request_info(ser):
+            ser.close()
+            return 1
+    except BadChecksum as e:
+        print(f"FAIL: {e}", file=sys.stderr)
+        ser.close()
+        return 1
+
     # Send WiFi credentials
     packet = build_wifi_packet(args.ssid, args.password)
     print(f"Sending WiFi credentials (SSID: {args.ssid})")
@@ -87,7 +136,12 @@ def main():
         if ser.in_waiting:
             buf += ser.read(ser.in_waiting)
             while True:
-                result = parse_improv_packet(buf)
+                try:
+                    result = parse_improv_packet(buf)
+                except BadChecksum as e:
+                    print(f"FAIL: {e}", file=sys.stderr)
+                    ser.close()
+                    return 1
                 if not result:
                     break
                 ptype, state, consumed = result
