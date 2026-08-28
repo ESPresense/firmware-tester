@@ -87,7 +87,7 @@ def request_info(ser, timeout=10):
                 if not result:
                     break
                 ptype, _, consumed = result
-                frame = buf[:consumed]
+                frame = buf[buf.find(b"IMPROV"):consumed]
                 buf = buf[consumed:]
                 if ptype == 0x04:  # RPC_Response
                     print(f"Device info: {frame[11:-1].decode('utf-8', 'replace')!r}")
