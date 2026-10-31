@@ -5,7 +5,7 @@ Hardware-in-the-loop harness for [ESPresense](https://github.com/ESPresense/ESPr
 ## What is in here
 
 * `scripts/improv_wifi.py` — provisions WiFi over [Improv Serial](https://www.improv-wifi.com/serial/): requests device info (validates the frames and their checksums), sends the credentials, and expects the `provisioning` state.
-* `scripts/hil_monitor.py` — watches the serial console for `--duration` seconds and fails on crash patterns, restarts, missing scan results, the MQTT reconnect limit, a misbehaving `/json` under concurrent load, or a declining heap (see the exit codes at the top of the file). `--dma-bisect` runs the A/B browser-load heap test.
+* `scripts/hil_monitor.py` — watches the serial console for `--duration` seconds and fails on crash patterns, restarts, missing scan results, the MQTT reconnect limit, a misbehaving `/json` under concurrent load, or a declining heap (see the exit codes at the top of the file).
 * `scripts/test_*.py` — host-side tests for the monitor's heuristics (`python3 -m pytest scripts`).
 * `Dockerfile` — the `ghcr.io/espresense/firmware-tester` image (PlatformIO + the scripts) used by the Arduino-era pipeline. The ESP-IDF firmware runs these scripts from the `espressif/idf` image and clones this repo at run time.
 
